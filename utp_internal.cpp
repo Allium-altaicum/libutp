@@ -2958,8 +2958,19 @@ int utp_process_udp(utp_context *ctx, const byte *buffer, size_t len, const stru
 		UTPSocketKeyData* keyData = ctx->utp_sockets->Lookup(UTPSocketKey(addr, id + 1));
 		if (keyData) {
 
+
+			UTPSocket *conn = keyData->socket;
+
+			if (conn->state == CS_SYN_RECV && conn->ack_nr == seq_nr) {
+			    // The ST_ACK corresponding to the previous ST_SYN packet from
+			    // the client was probably lost. The client is re-trying to
+			    // send the same ST_SYN packet so we re-send the same ST_ACK.
+			    conn->send_ack(true);
+			}
 			#if UTP_DEBUG_LOGGING
-			ctx->log(UTP_LOG_DEBUG, NULL, "rejected incoming connection, connection already exists");
+			else {
+			    ctx->log(UTP_LOG_DEBUG, NULL, "rejected incoming connection, connection already exists");
+			}
 			#endif
 
 			return 1;

@@ -1,0 +1,9 @@
+# use the official gcc image, based on debian
+# see https://hub.docker.com/_/gcc/
+
+image: gcc:bookworm
+
+build:
+  stage: build
+  script:
+    - make

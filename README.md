@@ -1,3 +1,5 @@
+ [![pipeline status](https://gitlab.com/equalitie/libutp/badges/main/pipeline.svg)](https://gitlab.com/equalitie/libutp/-/commits/main) 
+
 # libutp - The uTorrent Transport Protocol library.
 Copyright (c) 2010 BitTorrent, Inc.
 

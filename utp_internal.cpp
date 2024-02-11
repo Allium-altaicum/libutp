@@ -34,6 +34,11 @@
 #include "utp_internal.h"
 #include "utp_hash.h"
 
+#include <chrono>
+#include "third_party/windowed_filter.h"
+
+using namespace std::chrono_literals;
+
 #define	TIMEOUT_CHECK_INTERVAL	500
 
 // number of bytes to increase max window size by, per RTT. This is
@@ -559,6 +564,43 @@ struct UTPSocket {
 	// the slow-start threshold, in bytes
 	size_t ssthresh;
 
+	//Add some fields
+	struct VelocityState {
+		uint64_t velocity{1};
+		enum Direction {
+			None,
+			Up, // cwnd is increasing
+			Down, // cwnd is decreasing
+		};
+		Direction direction{None};
+		// number of rtts direction has remained same
+		uint64_t numTimesDirectionSame{0};
+		// updated every srtt
+		size_t lastRecordedCwndBytes;
+		std::chrono::microseconds lastCwndRecordTime;
+		bool recordCwnd{false};
+	};
+	VelocityState velocityState_;
+	double deltaParam_{0.5};
+	quic::WindowedFilter<
+		std::chrono::microseconds,
+		quic::MinFilter<std::chrono::microseconds>,
+		uint64_t,
+		uint64_t>
+		minRTTFilter_{std::chrono::microseconds(10s).count(), 0us, 0};// To get min RTT over 10 seconds
+
+	quic::WindowedFilter<
+		std::chrono::microseconds,
+		quic::MinFilter<std::chrono::microseconds>,
+		uint64_t,
+		uint64_t>
+		standingRTTFilter_{100000, 0us, 0};
+	std::chrono::microseconds latestRTT{0us};
+	std::chrono::microseconds RTTVAR{0us};
+	std::chrono::microseconds smoothedRTT{0us};
+	bool hasLastCwndDoubleTime_{false};
+	std::chrono::microseconds lastCwndDoubleTime_;
+
 	void log(int level, char const *fmt, ...)
 	{
 		va_list va;
@@ -608,8 +650,8 @@ struct UTPSocket {
 	void maybe_decay_win(uint64 current_ms)
 	{
 		if (can_decay_win(current_ms)) {
-			// TCP uses 0.5
-			max_window = (size_t)(max_window * .5);
+			// test 0.9
+			max_window = (size_t)(max_window * .9);
 			last_rwin_decay = current_ms;
 			if (max_window < MIN_WINDOW_SIZE)
 				max_window = MIN_WINDOW_SIZE;
@@ -668,7 +710,118 @@ struct UTPSocket {
 	void selective_ack(uint base, const byte *mask, byte len);
 	void apply_ccontrol(size_t bytes_acked, uint32 actual_delay, int64 min_rtt);
 	size_t get_packet_size() const;
+
+	void checkAndUpdateDirection(const std::chrono::microseconds actTime);
+	void changeDirection(VelocityState::Direction, const std::chrono::microseconds actTime);
+	void copaAcked(const std::chrono::microseconds now, const std::chrono::microseconds time_sent, size_t ackedPacketLen);
 };
+
+void UTPSocket::checkAndUpdateDirection(const std::chrono::microseconds ackTime){
+	if(!velocityState_.recordCwnd){
+		velocityState_.lastCwndRecordTime = ackTime;
+		velocityState_.lastRecordedCwndBytes = max_window;
+		velocityState_.recordCwnd = true;
+		return;
+	}
+	auto elapsed_time = ackTime - velocityState_.lastCwndRecordTime;
+
+	if(elapsed_time >= smoothedRTT){
+		auto newDirection = max_window > velocityState_.lastRecordedCwndBytes
+			? VelocityState::Direction::Up
+			: VelocityState::Direction::Down;
+		if(newDirection != velocityState_.direction){
+			// if direction changes, change velocity to 1
+			velocityState_.velocity = 1;
+			velocityState_.numTimesDirectionSame = 0;
+		}else{
+			velocityState_.numTimesDirectionSame++;
+			uint64_t velocityDirectionThreshold = 3;
+			if(velocityState_.numTimesDirectionSame > velocityDirectionThreshold){
+				velocityState_.velocity = 2 * velocityState_.velocity;
+			}
+		}
+		velocityState_.direction = newDirection;
+		velocityState_.lastCwndRecordTime = ackTime;
+		velocityState_.lastRecordedCwndBytes = max_window;
+	}
+}
+
+void UTPSocket::changeDirection(VelocityState::Direction newDirection,
+	const std::chrono::microseconds ackTime){
+	if(velocityState_.direction == newDirection){
+		return;
+	}
+	velocityState_.direction = newDirection;
+	velocityState_.velocity = 1;
+	velocityState_.lastCwndRecordTime = ackTime;
+	velocityState_.lastRecordedCwndBytes = max_window;
+}
+
+void UTPSocket::copaAcked(const std::chrono::microseconds now, const std::chrono::microseconds time_sent, size_t ackedPacketLen){
+	//update smoothed RTT
+	latestRTT = now - time_sent;
+	if(smoothedRTT == 0us){
+		smoothedRTT = latestRTT;
+		RTTVAR = latestRTT / 2;
+	}else{
+		const auto tmp = smoothedRTT > latestRTT ? smoothedRTT - latestRTT : latestRTT - smoothedRTT;
+		RTTVAR = RTTVAR * (4-1) / 4 + tmp / 4;
+		smoothedRTT = smoothedRTT * (8-1) / 8 + latestRTT / 8;
+	}
+
+	minRTTFilter_.Update(latestRTT, now.count());
+	auto rttMin = minRTTFilter_.GetBest();
+	standingRTTFilter_.SetWindowLength(smoothedRTT.count() / 2);
+	standingRTTFilter_.Update(latestRTT, now.count());
+	auto rttStandingMicroSec = standingRTTFilter_.GetBest().count();
+
+	uint64_t delayInMicroSec = rttStandingMicroSec - rttMin.count();
+	auto packetSize = get_packet_size();
+
+	bool increaseCwnd = false;
+	if (delayInMicroSec == 0){
+		increaseCwnd = true;
+	}else{
+		auto targetRate = (1.0 * packetSize * 1000000) / (deltaParam_ * delayInMicroSec);
+		auto currentRate = (1.0 * max_window * 1000000) / rttStandingMicroSec;
+		increaseCwnd = targetRate >= currentRate;
+	}
+
+	if(!(increaseCwnd && slow_start)){
+		checkAndUpdateDirection(now);
+	}
+
+	if(increaseCwnd){
+		if(!slow_start){
+			if(velocityState_.direction != VelocityState::Direction::Up &&
+				velocityState_.velocity > 1.0){
+				changeDirection(VelocityState::Direction::Up, now);
+			}
+			// v / delta * cwnd
+			//velocity is in packets, max_window is in bytes, so:
+			size_t addition = (ackedPacketLen * packetSize * packetSize *velocityState_.velocity) / (deltaParam_ * max_window);
+			max_window += addition;
+		}else{
+			if(!hasLastCwndDoubleTime_){
+				lastCwndDoubleTime_=now;
+				hasLastCwndDoubleTime_=true;
+			}else if(now - lastCwndDoubleTime_ > smoothedRTT){
+				max_window += max_window;
+				lastCwndDoubleTime_=now;
+			}
+		}
+	}else{
+		if(velocityState_.direction != VelocityState::Direction::Down &&
+			velocityState_.velocity > 1.0){
+			changeDirection(VelocityState::Direction::Down, now);
+		}
+		auto reduction = (ackedPacketLen * packetSize * packetSize *velocityState_.velocity) / (deltaParam_ * max_window);
+		slow_start = false;
+		max_window = reduction >= max_window ? (packetSize*8) : (max_window - reduction);
+	}
+
+	max_window = clamp<size_t>(max_window, MIN_WINDOW_SIZE, opt_sndbuf);
+}
 
 void removeSocketFromAckList(UTPSocket *conn)
 {
@@ -1215,7 +1368,7 @@ void UTPSocket::check_timeouts()
 					// idling. No need to be aggressive about resetting the
 					// congestion window. Just let it decay by a 3:rd.
 					// don't set it any lower than the packet size though
-					max_window = max(max_window * 2 / 3, size_t(packet_size));
+					//max_window = max(max_window * 2 / 3, size_t(packet_size));
 				} else {
 					// our delay was so high that our congestion window
 					// was shrunk below one packet, preventing us from
@@ -1361,7 +1514,8 @@ int UTPSocket::ack_packet(uint16 seq)
 	// if we never re-sent the packet, update the RTT estimate
 	if (pkt->transmissions == 1) {
 		// Estimate the round trip time.
-		const uint32 ertt = (uint32)((utp_call_get_microseconds(this->ctx, this) - pkt->time_sent) / 1000);
+		auto time_microseconds = utp_call_get_microseconds(this->ctx, this);
+		const uint32 ertt = (uint32)((time_microseconds - pkt->time_sent) / 1000);
 		if (rtt == 0) {
 			// First round trip time sample
 			rtt = ertt;
@@ -1384,6 +1538,7 @@ int UTPSocket::ack_packet(uint16 seq)
 			ertt, rtt, rtt_var, rto);
 		#endif
 
+		copaAcked(std::chrono::microseconds(time_microseconds), std::chrono::microseconds(pkt->time_sent), pkt->payload);
 	}
 	retransmit_timeout = rto;
 	rto_timeout = ctx->current_ms + rto;
@@ -2133,12 +2288,6 @@ size_t utp_process_incoming(UTPSocket *conn, const byte *packet, size_t len, boo
 		conn->our_hist.shift((uint32)(conn->our_hist.get_value() - min_rtt));
 	}
 
-	// only apply the congestion controller on acks
-	// if we don't have a delay measurement, there's
-	// no point in invoking the congestion control
-	if (actual_delay != 0 && acked_bytes >= 1)
-		conn->apply_ccontrol(acked_bytes, actual_delay, min_rtt);
-
 	// sanity check, the other end should never ack packets
 	// past the point we've sent
 	if (acks <= conn->cur_window_packets) {
@@ -2565,7 +2714,7 @@ void utp_initialize_socket(	utp_socket *conn,
 	conn->ctx->utp_sockets->Add(UTPSocketKey(conn->addr, conn->conn_id_recv))->socket = conn;
 
 	// we need to fit one packet in the window when we start the connection
-	conn->max_window = conn->get_packet_size();
+	conn->max_window = conn->get_packet_size() * 2;
 
 	#if UTP_DEBUG_LOGGING
 	conn->log(UTP_LOG_DEBUG, "UTP socket initialized");
